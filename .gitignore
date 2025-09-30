@@ -175,13 +175,4 @@ outputs/
 *.ckpt
 checkpoints/
 
-train.sh
-train*.sh
-
-run_training_spa_JYHome.py
-run_simulation_spa_JYHome.py
-
-sim.sh
-sim*.sh
-
 # nuplan-devkit/nuplan/planning/utils/multithreading/worker_ray.py
