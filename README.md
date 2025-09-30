@@ -16,7 +16,7 @@ nuPlan v1.1 Dataset 다운로드 (https://www.nuscenes.org/nuplan)
 - nuPlan Val Split
 
 ```bash
-# 경로 예시
+# 데이터 다운로드 경로 예시
 /home/jyyun/workshop/HMG_SNU_CarPLAN/dataset
 ```
 
