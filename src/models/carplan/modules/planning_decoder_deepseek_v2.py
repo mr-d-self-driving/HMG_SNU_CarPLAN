@@ -409,8 +409,6 @@ class DecoderLayer(nn.Module):
             tgt2, memory, memory, key_padding_mask=memory_key_padding_mask
         )[0]
         tgt = tgt + self.dropout2(tgt2)
-
-        dist_prediction = None
         
         tgt2 = self.norm4(tgt)
         if layer == 0:
@@ -425,7 +423,7 @@ class DecoderLayer(nn.Module):
         if scores is not None:
             scores = scores.reshape(bs, R, M, -1)
 
-        return tgt, dist_prediction, scores
+        return tgt, scores
 
 
 class PlanningDecoder(nn.Module):
@@ -560,10 +558,9 @@ class PlanningDecoder(nn.Module):
 
         q = self.q_proj(torch.cat([r_emb, m_emb], dim=-1))
         
-        dist_predictions = []
         scores_list = []
         for layer, blk in enumerate(self.decoder_blocks):
-            q, dist_prediction, scores = blk(
+            q, scores = blk(
                 q,
                 enc_emb,
                 tgt_key_padding_mask=r_key_padding_mask,
@@ -573,7 +570,6 @@ class PlanningDecoder(nn.Module):
                 layer = layer,
             )
             assert torch.isfinite(q).all()
-            dist_predictions.append(dist_prediction)
             if scores is not None:
                 scores_list.append(scores)
 
@@ -588,4 +584,4 @@ class PlanningDecoder(nn.Module):
 
         traj = torch.cat([loc, yaw, vel], dim=-1)
 
-        return traj, pi, None, None, None, None, None, None, dist_predictions, scores_list
+        return traj, pi, None, None, None, None, None, None, scores_list

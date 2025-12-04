@@ -128,15 +128,6 @@ class LightningTrainer(pl.LightningModule):
         """
         features, targets, scenarios = batch
         res = self.forward(features["feature"].data)
-        
-        if features["feature"].data["agent"]['position'].shape[2] != 101:
-            for key, value in features["feature"].data["agent"].items():
-                if key == "category":
-                    pass
-                elif key == "target":
-                    features["feature"].data["agent"][key] = value[:, :, :-30]
-                else:
-                    features["feature"].data["agent"][key] = value[:, :, :-30]
 
         losses = self._compute_objectives(res, features["feature"].data)
         metrics = self._compute_metrics(res, features["feature"].data, prefix)
@@ -191,28 +182,18 @@ class LightningTrainer(pl.LightningModule):
             ego_ref_free_reg_loss = ego_reg_loss.new_zeros(1)
 
         # prediction loss
-        if self.no_prediction_for_CLSR:
-            prediction_loss = ego_reg_loss.new_zeros(1)
-        else:
-            prediction_loss = self.get_prediction_loss(
-                data, prediction, valid_mask[:, 1:], target[:, 1:]
-            )
+        prediction_loss = self.get_prediction_loss(
+            data, prediction, valid_mask[:, 1:], target[:, 1:]
+        )
 
-        if self.no_displacement_for_CLSR == "all":
-            distance_loss_GT, distance_loss_pred = ego_reg_loss.new_zeros(1), ego_reg_loss.new_zeros(1)
-        else:
-            distance_loss_GT = self.get_distance_loss(
-                data, res['dist_prediction'][:train_num], res['dist_prediction_mask'][:train_num], res['dist_prediction_GT'][:train_num]
-            )
-            
-            if self.no_displacement_for_CLSR == "agent":
-                distance_loss_pred = ego_reg_loss.new_zeros(1)
-            else:
-                distance_loss_pred = self.get_distance_loss(
-                    data, res['dist_prediction'][:train_num, :res['dist_prediction_cal_from_pred'].shape[1]], \
-                        res['dist_prediction_mask'][:train_num, :res['dist_prediction_cal_from_pred'].shape[1]], \
-                            res['dist_prediction_cal_from_pred'][:train_num]
-                )
+        distance_loss_GT = self.get_distance_loss(
+            data, res['dist_prediction'][:train_num], res['dist_prediction_mask'][:train_num], res['dist_prediction_GT'][:train_num]
+        )
+        distance_loss_pred = self.get_distance_loss(
+            data, res['dist_prediction'][:train_num, :res['dist_prediction_cal_from_pred'].shape[1]], \
+                res['dist_prediction_mask'][:train_num, :res['dist_prediction_cal_from_pred'].shape[1]], \
+                    res['dist_prediction_cal_from_pred'][:train_num]
+        )
 
         if self.training and self.use_contrast_loss:
             contrastive_loss = self._compute_contrastive_loss(
@@ -255,47 +236,20 @@ class LightningTrainer(pl.LightningModule):
         valid_mask: (bs, A-1, T)
         target: (bs, A-1, 6)
         """
-        current_agent_pos = data["agent"]["position"][:, 1:, self.history_steps:]
-        dist = torch.norm(current_agent_pos, dim=-1) 
-        dist_temp = dist.clone()
-        # dist_temp[~valid_mask] = 0.0
-        alpha = 0.065
-        raw_weights = torch.exp(-alpha * dist_temp)#*1.5  # (bs, N)
-        d_max = torch.tensor(120) #dist_temp.max(dim=1)[0]
-        w_max, w_min = 1.5, 0.0
-        # weights = (raw_weights - torch.exp(-alpha*d_max[:, None])) / ((1 - torch.exp(-alpha*d_max[:, None]))+1e-5) * (w_max-w_min) + w_min
-        weights = (raw_weights - torch.exp(-alpha*d_max)) / ((1 - torch.exp(-alpha*d_max))+1e-5) * (w_max-w_min) + w_min
-            
-        if self.distance_loss_weight:
-            prediction_loss = (F.smooth_l1_loss(prediction[valid_mask], target[valid_mask], reduction="none")*weights[valid_mask][:, None]).sum(-1)
-        else:
-            prediction_loss = F.smooth_l1_loss(
-                prediction[valid_mask], target[valid_mask], reduction="none"
-            ).sum(-1)
+        prediction_loss = F.smooth_l1_loss(
+            prediction[valid_mask], target[valid_mask], reduction="none"
+        ).sum(-1)
         
         prediction_loss = prediction_loss.sum() / valid_mask.sum()
 
         return prediction_loss
     
     def get_distance_loss(self, data, prediction, valid_mask, GT):
+
+        prediction_loss = F.smooth_l1_loss(
+            prediction[valid_mask], GT[valid_mask], reduction="none"
+        ).sum(-1)
         
-        current_agent_pos = data["agent"]["position"][:, 1:, self.history_steps:]
-        dist = torch.norm(current_agent_pos, dim=-1) 
-        dist_temp = dist.clone()
-        # dist_temp[~valid_mask] = 0.0
-        alpha = 0.065
-        raw_weights = torch.exp(-alpha * dist_temp)#*1.5  # (bs, N)
-        d_max = torch.tensor(120) #dist_temp.max(dim=1)[0]
-        w_max, w_min = 1.5, 0.0
-        # weights = (raw_weights - torch.exp(-alpha*d_max[:, None])) / ((1 - torch.exp(-alpha*d_max[:, None]))+1e-5) * (w_max-w_min) + w_min
-        weights = (raw_weights - torch.exp(-alpha*d_max)) / ((1 - torch.exp(-alpha*d_max))+1e-5) * (w_max-w_min) + w_min
-        
-        if self.distance_loss_weight:
-            prediction_loss = (F.smooth_l1_loss(prediction[valid_mask], GT[valid_mask], reduction="none")*weights[valid_mask][:, None]).sum(-1)
-        else:
-            prediction_loss = F.smooth_l1_loss(
-                prediction[valid_mask], GT[valid_mask], reduction="none"
-            ).sum(-1)
         prediction_loss = prediction_loss.sum() / valid_mask.sum()
 
         return prediction_loss
@@ -379,54 +333,6 @@ class LightningTrainer(pl.LightningModule):
             torch.stack([logits_ap, logits_an], dim=1), labels
         )
         return triplet_contrastive_loss
-
-    def _compute_contrastive_loss_router(
-        self, hidden, valid_mask, normalize=True, tempreture=0.1
-    ):
-        """
-        Compute triplet loss
-
-        Args:
-            hidden: (3*bs, D)
-        """
-        if normalize:
-            hidden = F.normalize(hidden, dim=1, p=2)
-
-        if not valid_mask.any():
-            return hidden.new_zeros(1)
-
-        x_a, x_p, x_n = hidden.chunk(3, dim=0)
-
-        x_a = x_a[valid_mask]
-        x_p = x_p[valid_mask]
-        x_n = x_n[valid_mask]
-        
-        # KL Divergence Loss for original and positive (ensure similarity)
-        positive_loss = F.kl_div(x_a.log(), x_p, reduction='batchmean')
-
-        # KL Divergence for original and negative (want them to be different)
-        negative_loss = -F.kl_div(x_a.log(), x_n, reduction='batchmean')  # Maximize divergence
-
-        # Apply margin to negative loss to enforce separation
-        negative_loss = torch.relu(0.5 + negative_loss)  # Ensure it stays away from original
-    
-        # # Cosine Similarity for original and negative (want to be dissimilar)
-        # negative_similarity = torch.mean(F.cosine_similarity(x_a, x_n, dim=1))
-
-        # # Negative loss: Encourage lower similarity (push negative away)
-        # negative_loss = torch.relu(negative_similarity - 0.5)  # Ensure margin is satisfied
-
-        # Total loss: Encourage positive similarity, discourage negative similarity
-        total_loss = positive_loss + negative_loss
-
-        # logits_ap = (x_a * x_p).sum(dim=1) / tempreture
-        # logits_an = (x_a * x_n).sum(dim=1) / tempreture
-        # labels = x_a.new_zeros(x_a.size(0)).long()
-
-        # triplet_contrastive_loss = F.cross_entropy(
-        #     torch.stack([logits_ap, logits_an], dim=1), labels
-        # )
-        return total_loss
 
     def _compute_metrics(self, res, data, prefix) -> Dict[str, torch.Tensor]:
         """

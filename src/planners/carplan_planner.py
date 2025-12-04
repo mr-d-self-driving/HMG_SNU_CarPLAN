@@ -35,7 +35,6 @@ from .ml_planner_utils import global_trajectory_to_states, load_checkpoint
 
 import pickle
 
-from src.planners.vis_module import main_vis_tool
 from tuplan_garage.planning.simulation.planner.pdm_planner.observation.pdm_observation import PDMObservation # BH추가
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling # BH추가
 
@@ -98,8 +97,7 @@ class CarPLANPlanner(AbstractPlanner):
         self._learning_based_score_weight = learning_based_score_weight
             
         self._postprocessing = postprocessing
-        self._proposal_sampling = TrajectorySampling(num_poses=80, time_horizon=8.0) 
-        self.main_vis = main_vis_tool()
+        self._proposal_sampling = TrajectorySampling(num_poses=80, time_horizon=8.0)
 
     @torch.no_grad()
     def _infer_model(self, features: FeaturesType) -> npt.NDArray[np.float32]:
@@ -134,10 +132,6 @@ class CarPLANPlanner(AbstractPlanner):
             radius=self._eval_dt * self._eval_num_frames * 60 / 4.0,
         )
         self._planner_feature_builder.scenario_manager = self._scenario_manager
-
-        self.main_vis._observation = PDMObservation(self._proposal_sampling, self._proposal_sampling, map_radius=50, observation_sample_res=1) 
-        self.main_vis._map_api = initialization.map_api 
-        self.main_vis._load_route_dicts(initialization.route_roadblock_ids) 
 
     def name(self) -> str:
         """Inherited, see superclass."""
@@ -185,10 +179,6 @@ class CarPLANPlanner(AbstractPlanner):
 
         out = self._planner.forward(planner_feature_torch.data)
         
-        self.main_vis.out = out
-        self.main_vis.planner_input = planner_feature_torch.data
-        self.main_vis.scenario = scenario
-        
         candidate_trajectories = (
             out["candidate_trajectories"][0].cpu().numpy().astype(np.float64)
         )
@@ -198,14 +188,6 @@ class CarPLANPlanner(AbstractPlanner):
             predictions = out["output_prediction"][0].cpu().numpy()
         else:
             predictions = None
-
-        _, observation = current_input.history.current_state 
-        if current_input.iteration.index == 0:
-            self.main_vis._route_roadblock_correction(ego_state) 
-        self.main_vis._observation.update(ego_state, 
-                                            observation, 
-                                            current_input.traffic_light_data, 
-                                            self.main_vis._route_lane_dict) 
 
         ref_free_trajectory = (
             (out["output_ref_free_trajectory"][0].cpu().numpy().astype(np.float64))
@@ -232,57 +214,20 @@ class CarPLANPlanner(AbstractPlanner):
                 current_input.history.ego_states[-1],
                 ref_free_trajectory,
             )
-            if self._postprocessing:
-                rule_based_scores = self._trajectory_evaluator.evaluate(
-                    candidate_trajectories=candidate_trajectories,
-                    init_ego_state=current_input.history.ego_states[-1],
-                    detections=current_input.history.observations[-1],
-                    traffic_light_data=current_input.traffic_light_data,
-                    agents_info=self._get_agent_info(
-                        planner_feature.data, predictions, ego_state
-                    ),
-                    route_lane_dict=self._scenario_manager.get_route_lane_dicts(),
-                    drivable_area_map=self._scenario_manager.drivable_area_map,
-                    baseline_path=self._get_ego_baseline_path(
-                        self._scenario_manager.get_cached_reference_lines(), ego_state
-                    ),
-                )
 
-                final_scores = (
-                    rule_based_scores + self._learning_based_score_weight * learning_based_score
-                )
+            best_candidate_idx = learning_based_score.argmax()
 
-                best_candidate_idx = final_scores.argmax()
-                trajectory = candidate_trajectories[best_candidate_idx, 1:]
-                np_traj = trajectory.copy()
-                
-
-                trajectory = self._emergency_brake.brake_if_emergency(
-                    ego_state,
-                    self._trajectory_evaluator.time_to_at_fault_collision(best_candidate_idx),
-                    candidate_trajectories[best_candidate_idx],
+            trajectory = candidate_trajectories[best_candidate_idx, 1:]
+            np_traj = trajectory.copy()
+            trajectory = InterpolatedTrajectory(
+                global_trajectory_to_states(
+                    global_trajectory=trajectory,
+                    ego_history=current_input.history.ego_states,
+                    future_horizon=len(trajectory) * self._step_interval,
+                    step_interval=self._step_interval,
+                    include_ego_state=False,
                 )
-            else:
-                best_candidate_idx = learning_based_score.argmax()
-                trajectory = None
-            
-            # no emergency
-            if trajectory is None:
-                trajectory = candidate_trajectories[best_candidate_idx, 1:]
-                np_traj = trajectory.copy()
-                trajectory = InterpolatedTrajectory(
-                    global_trajectory_to_states(
-                        global_trajectory=trajectory,
-                        ego_history=current_input.history.ego_states,
-                        future_horizon=len(trajectory) * self._step_interval,
-                        step_interval=self._step_interval,
-                        include_ego_state=False,
-                    )
-                )
-        if self._render:
-            model_name=self._planner_ckpt.split("/")[-3] 
-            result_save_path = os.path.join(f"./exp/vis/{model_name}") 
-            self.main_vis._vis(current_input, np_traj, scenario_token, current_input.iteration.index, result_save_path) 
+            )
 
         return trajectory
 

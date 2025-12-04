@@ -164,9 +164,6 @@ class PlanningModel_MoE(TorchModuleWrapper):
         self.agent_predictor = AgentPredictor(dim=dim, future_steps=future_steps)
         self.dist_predictor = DistPredictor(dim=dim, future_steps=future_steps)
         
-        if self.av_cat:
-            self.av_cat_x_proj = nn.Linear(2 * dim, dim)
-        
         self.planning_decoder = deepseek_decoder(
             num_mode=num_modes,
             decoder_depth=decoder_depth,
@@ -266,10 +263,7 @@ class PlanningModel_MoE(TorchModuleWrapper):
             x = blk(x, key_padding_mask=key_padding_mask, return_attn_weights=False)
         x = self.norm(x) #torch.Size([B, N+1+M+S, 128])
 
-        if self.no_prediction_for_CLSR:
-            prediction = torch.zeros(bs, A-1, self.future_steps, 6).to(x)
-        else:
-            prediction = self.agent_predictor(x[:, 1:A]) #torch.Size([B, N, Future_step, 6])
+        prediction = self.agent_predictor(x[:, 1:A]) #torch.Size([B, N, Future_step, 6])
 
         x_scene_encoder = None
             
@@ -280,18 +274,13 @@ class PlanningModel_MoE(TorchModuleWrapper):
         if self.is_simulation:
             pass
         else:
-            if self.av_cat:
-                cat_av_dist = torch.cat([x[:, 1:], x[:, 0:1].repeat(1, A+M_shape+S_shape-1, 1)], dim=-1)
-                cat_av_dist = self.av_cat_x_proj(cat_av_dist)
-                dist_prediction = self.dist_predictor(cat_av_dist)
-            else:
-                dist_prediction = self.dist_predictor(x[:, 1:])
+            dist_prediction = self.dist_predictor(x[:, 1:])
 
         ref_line_available = data["reference_line"]["position"].shape[1] > 0
         R, M = data["reference_line"]["position"].shape[1], 12
         
         if ref_line_available:
-            trajectory, probability, pred_scenario_type, q, tgt_route, gates, load, gates_dict, dist_predictions, scores_list = self.planning_decoder(
+            trajectory, probability, pred_scenario_type, q, tgt_route, gates, load, gates_dict, scores_list = self.planning_decoder(
                 data, {"enc_emb": x, "enc_key_padding_mask": key_padding_mask, "enc_pos": pos, "x_scene_encoder": x_scene_encoder}
             )
         else:
@@ -315,52 +304,40 @@ class PlanningModel_MoE(TorchModuleWrapper):
             out["dist_prediction"] = dist_prediction
                 
         if not self.is_simulation:
-            if self.no_prediction_for_CLSR:
-                pass
-            elif self.no_displacement_for_CLSR == "all":
-                pass
-            else:
-                AV_future = data["agent"]["position"][:, :1, self.history_steps:self.history_steps+self.future_steps]
-                Agent_future = data["agent"]["position"][:, 1:, self.history_steps:self.history_steps+self.future_steps] # AV Centric future
-                Map_future = data["map"]["polygon_center"][:, :, :2].unsqueeze(-2).repeat(1, 1, self.future_steps, 1)
-                Static_future = data["static_objects"]["position"].unsqueeze(-2).repeat(1, 1, self.future_steps, 1)
-                
-                if self.no_displacement_for_CLSR == "agent":
-                    x_future = torch.cat([Map_future, Static_future], dim=1)
-                else:
-                    x_future = torch.cat([Agent_future, Map_future, Static_future], dim=1)
-                
-                dist_prediction_GT = x_future-AV_future
-                dist_prediction_GT_mask = data["agent"]["valid_mask"][:, :1, self.history_steps:self.history_steps+self.future_steps] * data["agent"]["valid_mask"][:, 1:, self.history_steps:self.history_steps+self.future_steps]
-                
-                dist_prediction_GT_Dist = torch.norm(dist_prediction_GT, dim=-1)
-                x_diff = (dist_prediction_GT[..., 0:1]) #.unsqueeze(-1).type(torch.float32)  # [1296, 48, 1]
-                y_diff = (dist_prediction_GT[..., 1:2]) #.unsqueeze(-1).type(torch.float32)  # [1296, 48, 1]
-                rot_prediction_GT = torch.atan2(y_diff.squeeze(-1), x_diff.squeeze(-1)) #.unsqueeze(-1).type(torch.float32)  # [1296, 48, 1]
+            AV_future = data["agent"]["position"][:, :1, self.history_steps:self.history_steps+self.future_steps]
+            Agent_future = data["agent"]["position"][:, 1:, self.history_steps:self.history_steps+self.future_steps] # AV Centric future
+            Map_future = data["map"]["polygon_center"][:, :, :2].unsqueeze(-2).repeat(1, 1, self.future_steps, 1)
+            Static_future = data["static_objects"]["position"].unsqueeze(-2).repeat(1, 1, self.future_steps, 1)
 
-                out["dist_prediction_GT"] = torch.stack((dist_prediction_GT_Dist, rot_prediction_GT), dim=-1)
-                if self.no_displacement_for_CLSR == "agent":
-                    out["dist_prediction_mask"] = torch.cat([polygon_key_padding.unsqueeze(-1).repeat(1, 1, self.future_steps), \
-                        static_key_padding.unsqueeze(-1).repeat(1, 1, self.future_steps)], dim=1)
-                else:
-                    out["dist_prediction_mask"] = torch.cat([dist_prediction_GT_mask, \
-                        (~polygon_key_padding).unsqueeze(-1).repeat(1, 1, self.future_steps), (~static_key_padding).unsqueeze(-1).repeat(1, 1, self.future_steps)], dim=1)
+            x_future = torch.cat([Agent_future, Map_future, Static_future], dim=1)
+            
+            dist_prediction_GT = x_future-AV_future
+            dist_prediction_GT_mask = data["agent"]["valid_mask"][:, :1, self.history_steps:self.history_steps+self.future_steps] * data["agent"]["valid_mask"][:, 1:, self.history_steps:self.history_steps+self.future_steps]
+            
+            dist_prediction_GT_Dist = torch.norm(dist_prediction_GT, dim=-1)
+            x_diff = (dist_prediction_GT[..., 0:1]) #.unsqueeze(-1).type(torch.float32)  # [1296, 48, 1]
+            y_diff = (dist_prediction_GT[..., 1:2]) #.unsqueeze(-1).type(torch.float32)  # [1296, 48, 1]
+            rot_prediction_GT = torch.atan2(y_diff.squeeze(-1), x_diff.squeeze(-1)) #.unsqueeze(-1).type(torch.float32)  # [1296, 48, 1]
 
-                pred_AV_centric = prediction[...,:2] + data["agent"]["position"][:, 1:, self.history_steps - 1][:,:, None]
+            out["dist_prediction_GT"] = torch.stack((dist_prediction_GT_Dist, rot_prediction_GT), dim=-1)
+            out["dist_prediction_mask"] = torch.cat([dist_prediction_GT_mask, \
+                (~polygon_key_padding).unsqueeze(-1).repeat(1, 1, self.future_steps), (~static_key_padding).unsqueeze(-1).repeat(1, 1, self.future_steps)], dim=1)
 
-                r_padding_mask = ~(data["reference_line"]["valid_mask"].any(-1))
-                probability.masked_fill_(r_padding_mask.unsqueeze(-1), -1e6)
+            pred_AV_centric = prediction[...,:2] + data["agent"]["position"][:, 1:, self.history_steps - 1][:,:, None]
 
-                bs, R, M, T, _ = trajectory.shape
-                flattened_probability = probability.reshape(bs, R * M)
-                AV_future = (trajectory.reshape(bs, R * M, T, -1)[torch.arange(bs), flattened_probability.argmax(-1)])[:,None,:,:2] #(bs, 1, 80, 2)
+            r_padding_mask = ~(data["reference_line"]["valid_mask"].any(-1))
+            probability.masked_fill_(r_padding_mask.unsqueeze(-1), -1e6)
 
-                dist_prediction_cal_from_pred = pred_AV_centric-AV_future
-                dist_prediction_cal_from_pred_Dist = torch.norm(dist_prediction_cal_from_pred, dim=-1)
-                x_diff = (dist_prediction_cal_from_pred[..., 0:1]) #.unsqueeze(-1).type(torch.float32)  # [1296, 48, 1]
-                y_diff = (dist_prediction_cal_from_pred[..., 1:2]) #.unsqueeze(-1).type(torch.float32)  # [1296, 48, 1]
-                rot_prediction_cal_from_pred = torch.atan2(y_diff.squeeze(-1), x_diff.squeeze(-1)) #.unsqueeze(-1).type(torch.float32)  # [1296, 48, 1]
-                out["dist_prediction_cal_from_pred"] = torch.stack((dist_prediction_cal_from_pred_Dist, rot_prediction_cal_from_pred), dim=-1)
+            bs, R, M, T, _ = trajectory.shape
+            flattened_probability = probability.reshape(bs, R * M)
+            AV_future = (trajectory.reshape(bs, R * M, T, -1)[torch.arange(bs), flattened_probability.argmax(-1)])[:,None,:,:2] #(bs, 1, 80, 2)
+
+            dist_prediction_cal_from_pred = pred_AV_centric-AV_future
+            dist_prediction_cal_from_pred_Dist = torch.norm(dist_prediction_cal_from_pred, dim=-1)
+            x_diff = (dist_prediction_cal_from_pred[..., 0:1]) #.unsqueeze(-1).type(torch.float32)  # [1296, 48, 1]
+            y_diff = (dist_prediction_cal_from_pred[..., 1:2]) #.unsqueeze(-1).type(torch.float32)  # [1296, 48, 1]
+            rot_prediction_cal_from_pred = torch.atan2(y_diff.squeeze(-1), x_diff.squeeze(-1)) #.unsqueeze(-1).type(torch.float32)  # [1296, 48, 1]
+            out["dist_prediction_cal_from_pred"] = torch.stack((dist_prediction_cal_from_pred_Dist, rot_prediction_cal_from_pred), dim=-1)
 
         if self.use_hidden_proj:
             out["hidden"] = self.hidden_proj(x[:, 0])
@@ -384,20 +361,15 @@ class PlanningModel_MoE(TorchModuleWrapper):
                 )
                 out["output_ref_free_trajectory"] = ref_free_traj
 
-            if self.no_prediction_for_CLSR:
-                output_prediction = torch.zeros(
-                    bs, A-1, self.future_steps, 5
-                )
-            else:
-                output_prediction = torch.cat(
-                    [
-                        prediction[..., :2] + agent_pos[:, 1:A, None],
-                        torch.atan2(prediction[..., 3], prediction[..., 2]).unsqueeze(-1)
-                        + agent_heading[:, 1:A, None, None],
-                        prediction[..., 4:6],
-                    ],
-                    dim=-1,
-                )
+            output_prediction = torch.cat(
+                [
+                    prediction[..., :2] + agent_pos[:, 1:A, None],
+                    torch.atan2(prediction[..., 3], prediction[..., 2]).unsqueeze(-1)
+                    + agent_heading[:, 1:A, None, None],
+                    prediction[..., 4:6],
+                ],
+                dim=-1,
+            )
             out["output_prediction"] = output_prediction
 
             if trajectory is not None:
